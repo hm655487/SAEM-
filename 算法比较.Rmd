@@ -1,0 +1,544 @@
+---
+title: "第四次上机"
+author: "黄脉PB22151749"
+date: "2024-12-08"
+output:
+  pdf_document:
+    latex_engine: xelatex
+  word_document: default
+documentclass: ctexart
+---
+
+```{r }
+# 全局禁用所有代码块的警告和消息
+knitr::opts_chunk$set(warning = FALSE, message = FALSE, echo = TRUE)
+library(showtext)
+showtext_auto()
+font_add("SimSun", "C:/Windows/Fonts/simsun.ttc")
+```
+
+
+miss.saem
+
+```{r}
+miss.saem <- function(X.obs,y,pos_var=1:ncol(X.obs),maxruns=500,tol_em=1e-7,nmcmc=2,tau=1,k1=50, seed=200, print_iter=TRUE, var_cal=FALSE, ll_obs_cal=FALSE) {
+  set.seed(seed)
+
+  #judge
+  #if (class(X.obs) == "data.frame") {
+  #  X.obs <- as.matrix(X.obs)
+  #}
+  if (sum(sapply(X.obs, is.numeric)) < ncol(X.obs)) {
+    stop("Error: the variables should be numeric.")
+  }
+  if (sum(y==1) +  sum(y==0) < nrow(X.obs)) {
+    stop("Error: y must be coded by 0 or 1, and there is no missing data in y.")
+  }
+
+  if (sum(pos_var %in% 1:ncol(X.obs)) < length(pos_var))  {
+    stop("Error: index of selected variables must be in the range of covariates.")
+  }
+
+  if (length(unique(pos_var)) != length(pos_var)){
+    stop("Error: index of selected variables must not be repeated.")
+  }
+
+  p=ncol(X.obs)
+
+  #delete rows completely missing
+  if(any(apply(is.na(X.obs),1,sum)==p)){
+    i_allNA=which(apply(is.na(X.obs),1,sum)==p)
+    X.obs = X.obs[-i_allNA,]
+    y = y[-i_allNA]
+  }
+  if(any((is.na(y))==TRUE)){
+    i_YNA=which(is.na(y)==TRUE)
+    X.obs = X.obs[-i_YNA,]
+    y = y[-i_YNA]
+  }
+  n=length(y)
+
+
+  rindic = as.matrix(is.na(X.obs))
+  if(sum(rindic)>0){
+    whichcolmissing = (1:ncol(rindic))[apply(rindic,2,sum)>0]
+    missingcols = length(whichcolmissing)
+  }
+  if(sum(rindic)==0){missingcols=0}
+
+
+  ptm <- Sys.time()
+  if(missingcols>0){
+    k=0
+    cstop=0.1
+    seqbeta = matrix(NA,nrow=ncol(X.obs)+1,ncol=(maxruns+1))
+    seqbeta_avg = matrix(NA,nrow=ncol(X.obs)+1,ncol=(maxruns+1))
+
+    X.mean = X.obs
+    for(i in 1:ncol(X.mean)){
+      X.mean[is.na(X.mean[,i]), i] <- mean(X.mean[,i], na.rm = TRUE)
+    }
+    X.sim <- X.mean
+
+    mu = apply(X.mean,2,mean)
+    Sigma = var(X.mean)*(n-1)/n
+    beta= rep(0,p+1)
+    beta[c(1,pos_var+1)]= glm(y~ X.mean[,pos_var],family=binomial(link='logit'))$coef
+
+    while ((cstop>tol_em)*(k<maxruns)|(k<20)){
+      k = k+1
+      beta.old = beta
+
+      if(k <k1){gamma <- 1}else{gamma <- 1/(k-(k1-1))^tau}
+
+      S.inv <- solve(Sigma)
+
+      for (i in (1:n)) {
+        jna <- which(is.na(X.obs[i,]))
+        njna <- length(jna)
+        if (njna>0) {
+          xi <- X.sim[i,]
+          Oi <- solve(S.inv[jna,jna])
+          mi <- mu[jna]
+          lobs <- beta[1]
+          if (njna<p) {
+            jobs <- setdiff(1:p,jna)
+            mi <- mi - (xi[jobs] - mu[jobs])%*%S.inv[jobs,jna]%*%Oi
+            lobs <- lobs + sum(xi[jobs]*beta[jobs+1])
+          }
+
+          cobs <- exp(lobs)
+          if(cobs==0){cobs=.Machine$double.xmin}
+          if(cobs==Inf){cobs=.Machine$double.xmax}
+
+          xina <- xi[jna]
+          betana <- beta[jna+1]
+          for (m in (1:nmcmc)) {
+            xina.c <- mi + rnorm(njna)%*%chol(Oi)
+
+            if (y[i]==1)
+              alpha <- (1+exp(-sum(xina*betana))/cobs)/(1+exp(-sum(xina.c*betana))/cobs)
+            else
+              alpha <- (1+exp(sum(xina*betana))*cobs)/(1+exp(sum(xina.c*betana))*cobs)
+            if (runif(1) < alpha){
+              xina <- xina.c
+            }
+          }
+          X.sim[i,jna] <- xina
+        }
+      }
+      beta_new= rep(0,p+1)
+      beta_new[c(1,pos_var+1)]= glm(y~ X.sim[,pos_var],family=binomial(link='logit'))$coef
+
+      beta <- (1-gamma)*beta + gamma*beta_new
+      cstop = sum((beta-beta.old)^2)
+
+      mu <- (1-gamma)*mu + gamma*colMeans(X.sim)
+      Sigma <- (1-gamma)*Sigma + gamma*cov(X.sim)
+
+      seqbeta[,k]=beta.old
+
+      if(k==1){
+        seqbeta_avg[,k]=beta.old
+      }else{
+        seqbeta_avg[,k]= 1/k*rowSums(seqbeta[,1:k])
+      }
+
+      if(print_iter==TRUE & k %% 10 == 0){
+        cat(sprintf('iteration = %i ', k))
+        cat(sprintf('beta ='),beta,'\n')
+        cat(sprintf('Distance from last iteration ='),cstop,'\n')
+      }
+    }
+    var_obs = ll = std_obs =NULL
+    if(var_cal==TRUE){
+      var_obs = louis_lr_saem(beta,mu,Sigma,y,X.obs,pos_var,rindic,whichcolmissing,mc.size=1000)
+      std_obs <- sqrt(diag(var_obs))
+    }
+    if(ll_obs_cal==TRUE){
+      ll= likelihood_saem(beta,mu,Sigma,y,X.obs,rindic,whichcolmissing,mc.size=1000)
+    }
+  }
+  if(missingcols==0){
+    X.obs = matrix(X.obs,nrow=n)
+    data.complete <- data.frame(y=y,X.obs)
+    model.complete <- glm(y ~.,family=binomial(link='logit'),data=data.complete)
+    mu = apply(X.obs,2,mean)
+    Sigma = var(X.obs)*(n-1)/n
+    beta <- model.complete$coefficients
+    var_obs = ll = ll1 =ll2= std_obs =seqbeta_avg= seqbeta=NULL
+    if(var_cal==TRUE){
+      P <- predict(model.complete, type = "response")
+      W <- diag(P*(1-P))
+      X <- model.matrix(model.complete)
+
+      var_obs <- solve(t(X)%*%W%*%X)
+      std_obs <- sqrt(diag(var_obs))
+    }
+    if(ll_obs_cal==TRUE){
+      ll = likelihood_saem(beta,mu,Sigma,y,X.obs,rindic,whichcolmissing,mc.size=1000)
+    }
+  }
+  time_run=Sys.time() - ptm
+  return(list(mu=mu, sig2=Sigma, beta=beta,time_run=time_run,seqbeta=seqbeta,seqbeta_avg=seqbeta_avg,ll=ll,var_obs=var_obs,std_obs=std_obs))
+}
+```
+
+我们现在想要评估SAEM算法的性能
+
+```{r}
+library(misaem)
+library(MASS)
+library(mvtnorm)
+library(ggplot2)
+library(RColorBrewer)
+theme_set(theme_bw())
+library(tidyr)
+library(dplyr)
+library(xtable)
+
+```
+
+# 评估saem性能
+
+```{r}
+# 加载必要的包
+library(ggplot2)
+library(tidyr)
+library(dplyr)
+library(xtable)
+
+# 修改MCAR和MAR的数据生成函数，确保生成的缺失值模式更稳定
+create_MCAR <- function(X, missing_rate) {
+  X_miss <- as.matrix(X)
+  n <- nrow(X)
+  p <- ncol(X)
+  for(j in 1:p) {
+    missing_indices <- rbinom(n, 1, missing_rate)
+    X_miss[missing_indices == 1, j] <- NA
+  }
+  return(X_miss)
+}
+
+create_MAR <- function(X, missing_rate) {
+  X_miss <- as.matrix(X)
+  n <- nrow(X)
+  p <- ncol(X)
+  
+  # 使用第一个变量的值来生成缺失概率
+  prob_miss <- pnorm(scale(X[,1]))
+  prob_miss[is.na(prob_miss)] <- mean(prob_miss, na.rm = TRUE)
+  
+  for(j in 2:p) {
+    missing_probs <- pmin(prob_miss * missing_rate, 1)
+    missing_indices <- rbinom(n, 1, missing_probs)
+    X_miss[missing_indices == 1, j] <- NA
+  }
+  return(X_miss)
+}
+
+# 修改测试函数，添加错误处理
+run_test <- function(X, y, mechanism, rate, beta_complete) {
+  tryCatch({
+    start_time <- Sys.time()
+    
+    # 创建缺失数据
+    if(mechanism == "MCAR") {
+      X_miss <- create_MCAR(X, rate)
+    } else {
+      X_miss <- create_MAR(X, rate)
+    }
+    
+    # 检查缺失值比例
+    actual_missing_rate <- sum(is.na(X_miss)) / (nrow(X_miss) * ncol(X_miss))
+    if(abs(actual_missing_rate - rate) > 0.1) {
+      warning(sprintf("实际缺失率 (%f) 与目标缺失率 (%f) 差异过大", 
+                     actual_missing_rate, rate))
+    }
+    
+    # 运行SAEM
+    saem_result <- miss.saem(X_miss, y, pos_var=1:ncol(X), 
+                            maxruns=500, tol_em=1e-6, 
+                            print_iter=FALSE, var_cal=TRUE)
+    
+    end_time <- Sys.time()
+    runtime <- as.numeric(difftime(end_time, start_time, units = "secs"))
+    
+    # 计算性能指标
+    mse <- mean((saem_result$beta - beta_complete)^2, na.rm = TRUE)
+    mae <- mean(abs(saem_result$beta - beta_complete), na.rm = TRUE)
+    
+    return(list(
+      beta = saem_result$beta,
+      std_obs = saem_result$std_obs,
+      mse = mse,
+      mae = mae,
+      runtime = runtime,
+      success = TRUE
+    ))
+  }, error = function(e) {
+    warning(sprintf("实验失败: %s", e$message))
+    return(list(
+      beta = rep(NA, length(beta_complete)),
+      std_obs = NA,
+      mse = NA,
+      mae = NA,
+      runtime = NA,
+      success = FALSE
+    ))
+  })
+}
+
+# 主实验循环
+n_experiments <- 100
+missing_rates <- c(0.05, 0.1, 0.15)
+
+all_results <- data.frame(
+  Experiment = numeric(),
+  Mechanism = character(),
+  Missing_Rate = numeric(),
+  MSE = numeric(),
+  MAE = numeric(),
+  Runtime = numeric(),
+  Success = logical(),
+  stringsAsFactors = FALSE
+)
+
+for(exp in 1:n_experiments) {
+  cat(sprintf("\n执行实验 %d/%d\n", exp, n_experiments))
+  
+  set.seed(exp * 123)  # 使用不同的种子
+  
+  # 加载并预处理数据
+  data(mtcars)
+  y <- mtcars$vs
+  X <- scale(mtcars[, c("mpg", "disp")])
+  
+  # 创建完整数据的模型
+  model_complete <- glm(y ~ X, family = binomial(link = "logit"))
+  beta_complete <- coef(model_complete)
+  
+  for(mechanism in c("MCAR", "MAR")) {
+    for(rate in missing_rates) {
+      cat(sprintf("Running test: %s, Missing rate: %f\n", mechanism, rate))
+      
+      result <- run_test(X, y, mechanism, rate, beta_complete)
+      
+      all_results <- rbind(all_results, data.frame(
+        Experiment = exp,
+        Mechanism = mechanism,
+        Missing_Rate = rate,
+        MSE = result$mse,
+        MAE = result$mae,
+        Runtime = result$runtime,
+        Success = result$success
+      ))
+    }
+  }
+  
+  # 每10次实验保存一次结果
+  if(exp %% 10 == 0) {
+    write.csv(all_results, 
+              sprintf("simulation_results_checkpoint_%d.csv", exp), 
+              row.names = FALSE)
+  }
+}
+
+# 分析成功的实验结果
+successful_results <- subset(all_results, Success == TRUE)
+
+# 汇总统计
+summary_stats <- successful_results %>%
+  group_by(Mechanism, Missing_Rate) %>%
+  summarise(
+    n_success = n(),
+    Mean_MSE = mean(MSE, na.rm = TRUE),
+    SD_MSE = sd(MSE, na.rm = TRUE),
+    Mean_MAE = mean(MAE, na.rm = TRUE),
+    SD_MAE = sd(MAE, na.rm = TRUE),
+    Mean_Runtime = mean(Runtime, na.rm = TRUE),
+    Success_Rate = n() / n_experiments * 100,
+    .groups = 'drop'
+  )
+
+print(summary_stats)
+# 首先检查数据
+str(successful_results)
+summary(successful_results)
+
+# 确保数据类型正确，并处理可能的NA值
+successful_results <- successful_results %>%
+  mutate(
+    Missing_Rate = as.numeric(as.character(Missing_Rate)),
+    MSE = as.numeric(as.character(MSE)),
+    MAE = as.numeric(as.character(MAE))
+  ) %>%
+  filter(!is.na(MSE), !is.na(MAE))
+
+# 重新创建MSE的箱线图，简化版本
+p_mse <- ggplot(successful_results, 
+                aes(x = factor(Missing_Rate), 
+                    y = MSE, 
+                    fill = Mechanism)) +
+  geom_boxplot() +
+  theme_minimal() +
+  labs(title = "MSE Distribution",
+       x = "Missing Rate",
+       y = "MSE") +
+  theme(legend.position = "top")
+print(p_mse)
+# 重新创建MAE的箱线图，简化版本
+p_mae <- ggplot(successful_results, 
+                aes(x = factor(Missing_Rate), 
+                    y = MAE, 
+                    fill = Mechanism)) +
+  geom_boxplot() +
+  theme_minimal() +
+  labs(title = "MAE Distribution",
+       x = "Missing Rate",
+       y = "MAE") +
+  theme(legend.position = "top")
+print(p_mae)
+
+```
+
+
+# 不同方法比较
+```{r}
+library(mice)
+library(Amelia)
+
+# 生成模拟数据的函数
+generate_data <- function(n, p, missing_rate = 0.2, seed = 123) {
+  set.seed(seed)
+  
+  # 生成协变量
+  X <- matrix(rnorm(n * p), nrow = n)
+  
+  # 真实参数
+  beta_true <- c(1, rep(0.5, p))
+  
+  # 生成响应变量
+  linear_pred <- cbind(1, X) %*% beta_true
+  prob <- 1 / (1 + exp(-linear_pred))
+  y <- rbinom(n, 1, prob)
+  
+  # 随机生成缺失值
+  for(j in 1:p) {
+    miss_ind <- sample(1:n, size = floor(n * missing_rate))
+    X[miss_ind, j] <- NA
+  }
+  
+  return(list(X = X, y = y, beta_true = beta_true))
+}
+
+# 评估函数
+evaluate_method <- function(beta_est, beta_se, beta_true) {
+  bias <- mean(beta_est - beta_true)
+  rmse <- sqrt(mean((beta_est - beta_true)^2))
+  coverage <- mean(beta_true >= (beta_est - 1.96*beta_se) & 
+                  beta_true <= (beta_est + 1.96*beta_se))
+  
+  return(c(bias = bias, rmse = rmse, coverage = coverage))
+}
+
+# 主模拟函数
+run_simulation <- function(n_sim = 100, n = 200, p = 3, missing_rate = 0.2) {
+  results <- list()
+  
+  # 存储结果的矩阵
+  results_saem <- matrix(NA, n_sim, 3)
+  results_mice <- matrix(NA, n_sim, 3)
+  results_amelia <- matrix(NA, n_sim, 3)
+  
+  for(i in 1:n_sim) {
+    # 生成数据
+    data <- generate_data(n, p, missing_rate, seed = i)
+    
+    # 1. SAEM方法
+    saem_fit <- miss.saem(data$X, data$y, pos_var = 1:p, 
+                         var_cal = TRUE, print_iter = FALSE)
+    
+    # 2. MICE方法
+    mice_data <- data.frame(y = data$y)
+    for(j in 1:p) {
+      mice_data[paste0("X", j)] <- data$X[,j]
+    }
+    mice_imp <- mice(mice_data, m = 5, print = FALSE)
+    
+    # 创建公式
+    formula_str <- paste("y ~", paste(paste0("X", 1:p), collapse = " + "))
+    mice_fits <- with(mice_imp, glm(as.formula(formula_str), family = binomial()))
+    mice_pooled <- pool(mice_fits)
+    
+    # 3. Amelia方法
+    amelia_data <- mice_data
+    amelia_imp <- amelia(amelia_data, m = 5, p2s = 0)
+    amelia_results <- matrix(NA, 5, p + 1)
+    
+    for(j in 1:5) {
+      imp_data <- amelia_imp$imputations[[j]]
+      fit <- glm(as.formula(formula_str), data = imp_data, family = binomial())
+      amelia_results[j,] <- coef(fit)
+    }
+    
+    # 评估结果
+    results_saem[i,] <- evaluate_method(saem_fit$beta, 
+                                      saem_fit$std_obs, 
+                                      data$beta_true)
+    
+    results_mice[i,] <- evaluate_method(summary(mice_pooled)$estimate,
+                                      summary(mice_pooled)$std.error,
+                                      data$beta_true)
+    
+    results_amelia[i,] <- evaluate_method(colMeans(amelia_results),
+                                        apply(amelia_results, 2, sd),
+                                        data$beta_true)
+    
+    if(i %% 10 == 0) cat("Completed simulation", i, "of", n_sim, "\n")
+  }
+  
+  # 整理结果
+  results$saem <- colMeans(results_saem)
+  results$mice <- colMeans(results_mice)
+  results$amelia <- colMeans(results_amelia)
+  
+  names(results$saem) <- names(results$mice) <- names(results$amelia) <- 
+    c("Bias", "RMSE", "Coverage")
+  
+  return(results)
+}
+
+# 运行模拟
+set.seed(123)
+sim_results <- run_simulation(n_sim = 100, n = 200, p = 3, missing_rate = 0.2)
+
+# 打印结果
+print("SAEM Results:")
+print(round(sim_results$saem, 4))
+print("MICE Results:")
+print(round(sim_results$mice, 4))
+print("Amelia Results:")
+print(round(sim_results$amelia, 4))
+
+# 可视化结果
+library(ggplot2)
+library(reshape2)
+
+results_df <- data.frame(
+  Method = rep(c("SAEM", "MICE", "Amelia"), each = 3),
+  Metric = rep(c("Bias", "RMSE", "Coverage"), 3),
+  Value = c(sim_results$saem, sim_results$mice, sim_results$amelia)
+)
+
+ggplot(results_df, aes(x = Method, y = Value, fill = Metric)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  facet_wrap(~Metric, scales = "free") +
+  theme_minimal() +
+  labs(title = "Comparison of Methods",
+       y = "Value",
+       x = "Method")
+
+```
+
+

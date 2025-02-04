@@ -1,0 +1,348 @@
+---
+title: "第四次上机"
+author: "黄脉PB22151749"
+date: "2024-12-08"
+output:
+  pdf_document:
+    latex_engine: xelatex
+  word_document: default
+documentclass: ctexart
+---
+
+```{r }
+# 全局禁用所有代码块的警告和消息
+knitr::opts_chunk$set(warning = FALSE, message = FALSE, echo = TRUE)
+library(showtext)
+showtext_auto()
+font_add("SimSun", "C:/Windows/Fonts/simsun.ttc")
+```
+
+在使用SAEM估计参数之后，下一个目标是在存在缺失值的情况下进行变量选择。
+
+```{r}
+library(misaem)
+library(MASS)
+library(mvtnorm)
+```
+
+miss.saem
+
+```{r}
+miss.saem <- function(X.obs,y,pos_var=1:ncol(X.obs),maxruns=500,tol_em=1e-7,nmcmc=2,tau=1,k1=50, seed=200, print_iter=TRUE, var_cal=FALSE, ll_obs_cal=FALSE) {
+  set.seed(seed)
+
+  #judge
+  #if (class(X.obs) == "data.frame") {
+   # X.obs <- as.matrix(X.obs)
+  #}
+  if (sum(sapply(X.obs, is.numeric)) < ncol(X.obs)) {
+    stop("Error: the variables should be numeric.")
+  }
+  if (sum(y==1) +  sum(y==0) < nrow(X.obs)) {
+    stop("Error: y must be coded by 0 or 1, and there is no missing data in y.")
+  }
+
+  if (sum(pos_var %in% 1:ncol(X.obs)) < length(pos_var))  {
+    stop("Error: index of selected variables must be in the range of covariates.")
+  }
+
+  if (length(unique(pos_var)) != length(pos_var)){
+    stop("Error: index of selected variables must not be repeated.")
+  }
+
+  p=ncol(X.obs)
+
+  #delete rows completely missing
+  if(any(apply(is.na(X.obs),1,sum)==p)){
+    i_allNA=which(apply(is.na(X.obs),1,sum)==p)
+    X.obs = X.obs[-i_allNA,]
+    y = y[-i_allNA]
+  }
+  if(any((is.na(y))==TRUE)){
+    i_YNA=which(is.na(y)==TRUE)
+    X.obs = X.obs[-i_YNA,]
+    y = y[-i_YNA]
+  }
+  n=length(y)
+
+
+  rindic = as.matrix(is.na(X.obs))
+  if(sum(rindic)>0){
+    whichcolmissing = (1:ncol(rindic))[apply(rindic,2,sum)>0]
+    missingcols = length(whichcolmissing)
+  }
+  if(sum(rindic)==0){missingcols=0}
+
+
+  ptm <- Sys.time()
+  if(missingcols>0){
+    k=0
+    cstop=0.1
+    seqbeta = matrix(NA,nrow=ncol(X.obs)+1,ncol=(maxruns+1))
+    seqbeta_avg = matrix(NA,nrow=ncol(X.obs)+1,ncol=(maxruns+1))
+
+    X.mean = X.obs
+    for(i in 1:ncol(X.mean)){
+      X.mean[is.na(X.mean[,i]), i] <- mean(X.mean[,i], na.rm = TRUE)
+    }
+    X.sim <- X.mean
+
+    mu = apply(X.mean,2,mean)
+    Sigma = var(X.mean)*(n-1)/n
+    beta= rep(0,p+1)
+    beta[c(1,pos_var+1)]= glm(y~ X.mean[,pos_var],family=binomial(link='logit'))$coef
+
+    while ((cstop>tol_em)*(k<maxruns)|(k<20)){
+      k = k+1
+      beta.old = beta
+
+      if(k <k1){gamma <- 1}else{gamma <- 1/(k-(k1-1))^tau}
+
+      S.inv <- solve(Sigma)
+
+      for (i in (1:n)) {
+        jna <- which(is.na(X.obs[i,]))
+        njna <- length(jna)
+        if (njna>0) {
+          xi <- X.sim[i,]
+          Oi <- solve(S.inv[jna,jna])
+          mi <- mu[jna]
+          lobs <- beta[1]
+          if (njna<p) {
+            jobs <- setdiff(1:p,jna)
+            mi <- mi - (xi[jobs] - mu[jobs])%*%S.inv[jobs,jna]%*%Oi
+            lobs <- lobs + sum(xi[jobs]*beta[jobs+1])
+          }
+
+          cobs <- exp(lobs)
+          if(cobs==0){cobs=.Machine$double.xmin}
+          if(cobs==Inf){cobs=.Machine$double.xmax}
+
+          xina <- xi[jna]
+          betana <- beta[jna+1]
+          for (m in (1:nmcmc)) {
+            xina.c <- mi + rnorm(njna)%*%chol(Oi)
+
+            if (y[i]==1)
+              alpha <- (1+exp(-sum(xina*betana))/cobs)/(1+exp(-sum(xina.c*betana))/cobs)
+            else
+              alpha <- (1+exp(sum(xina*betana))*cobs)/(1+exp(sum(xina.c*betana))*cobs)
+            if (runif(1) < alpha){
+              xina <- xina.c
+            }
+          }
+          X.sim[i,jna] <- xina
+        }
+      }
+      beta_new= rep(0,p+1)
+      beta_new[c(1,pos_var+1)]= glm(y~ X.sim[,pos_var],family=binomial(link='logit'))$coef
+
+      beta <- (1-gamma)*beta + gamma*beta_new
+      cstop = sum((beta-beta.old)^2)
+
+      mu <- (1-gamma)*mu + gamma*colMeans(X.sim)
+      Sigma <- (1-gamma)*Sigma + gamma*cov(X.sim)
+
+      seqbeta[,k]=beta.old
+
+      if(k==1){
+        seqbeta_avg[,k]=beta.old
+      }else{
+        seqbeta_avg[,k]= 1/k*rowSums(seqbeta[,1:k])
+      }
+
+      if(print_iter==TRUE & k %% 10 == 0){
+        cat(sprintf('iteration = %i ', k))
+        cat(sprintf('beta ='),beta,'\n')
+        cat(sprintf('Distance from last iteration ='),cstop,'\n')
+      }
+    }
+    var_obs = ll = std_obs =NULL
+    if(var_cal==TRUE){
+      var_obs = louis_lr_saem(beta,mu,Sigma,y,X.obs,pos_var,rindic,whichcolmissing,mc.size=1000)
+      std_obs <- sqrt(diag(var_obs))
+    }
+    if(ll_obs_cal==TRUE){
+      ll= likelihood_saem(beta,mu,Sigma,y,X.obs,rindic,whichcolmissing,mc.size=1000)
+    }
+  }
+  if(missingcols==0){
+    X.obs = matrix(X.obs,nrow=n)
+    data.complete <- data.frame(y=y,X.obs)
+    model.complete <- glm(y ~.,family=binomial(link='logit'),data=data.complete)
+    mu = apply(X.obs,2,mean)
+    Sigma = var(X.obs)*(n-1)/n
+    beta <- model.complete$coefficients
+    var_obs = ll = ll1 =ll2= std_obs =seqbeta_avg= seqbeta=NULL
+    if(var_cal==TRUE){
+      P <- predict(model.complete, type = "response")
+      W <- diag(P*(1-P))
+      X <- model.matrix(model.complete)
+
+      var_obs <- solve(t(X)%*%W%*%X)
+      std_obs <- sqrt(diag(var_obs))
+    }
+    if(ll_obs_cal==TRUE){
+      ll = likelihood_saem(beta,mu,Sigma,y,X.obs,rindic,whichcolmissing,mc.size=1000)
+    }
+  }
+  time_run=Sys.time() - ptm
+  return(list(mu=mu, sig2=Sigma, beta=beta,time_run=time_run,seqbeta=seqbeta,seqbeta_avg=seqbeta_avg,ll=ll,var_obs=var_obs,std_obs=std_obs))
+}
+```
+
+
+这里我们首先给定参数的真实值。 （通过使用不同的值，我们可以构建不同的设置，例如受试者数量 n 或相关结构。
+
+```{r}
+n <- 1000  # number of subjects
+p <- 5     # number of explanatory variables
+mu.star <- 1:p  # mean of the explanatory variables
+sd <- 1:p # standard deviations
+
+# with correlation
+C <- matrix(c(   # correlation matrix
+  1,   0.8, 0,   0,   0,
+  0.8, 1,   0,   0,   0,
+  0,   0,   1,   0.3, 0.6,
+  0,   0,   0.3, 1,   0.7,
+  0,   0,   0.6, 0.7, 1
+), nrow=p)
+## or without correlation
+# C = diag(p)
+
+Sigma.star <- diag(sd)%*%C%*%diag(sd) # variance-covariance matrix of the explanatory variables
+
+beta.star <- c(0.5, 0, 1, 0, -0.6)  # coefficients of logistic regression
+beta0.star <- -0.2  # intercept
+beta.true = c(beta0.star,beta.star)
+
+#percentage of missingness
+p.miss <- 0.10 
+```
+
+我们考虑基于惩罚似然的标准，如AIC和BIC，来进行变量选择。\
+对于每一种变量组合，我们使用SAEM估计参数，然后计算观测对数似然。最后，我们根据AIC或BIC的最小值选择最佳模型。\
+我们进行了100次模拟重复，并计算了以下百分比：每个标准选择真实模型（C）的百分比，过度拟合（O）的百分比——即选择的变量比实际多的情况，以及欠拟合（U）的百分比——即选择的变量比实际少的情况。
+
+```{r}
+nb.simu = 100
+
+subsets=combinations(p)
+
+ll = AIC = BIC = matrix(0, nrow = nb.simu, ncol = nrow(subsets)-1)
+
+AIC_min =BIC_min = matrix(1e+5,nrow = nb.simu,ncol = p)
+j_AIC = j_BIC  = matrix(0,nrow = nb.simu,ncol = p)
+
+AIC_all_min =BIC_all_min = rep(1e+5,nb.simu)
+j_all_AIC = j_all_BIC = rep(0,nb.simu)
+
+for(nb in 1:nb.simu){
+  set.seed(nb)
+  cat('simu ',nb,'\n')
+  # complete data simulation
+  X.complete <- matrix(rnorm(n*p), nrow=n)%*%chol(Sigma.star) + matrix(rep(mu.star,n), nrow=n, byrow = TRUE)
+  p1 <- 1/(1+exp(-X.complete%*%beta.star-beta0.star))
+  y <- as.numeric(runif(n)<p1)
+  
+  # generate missingness
+  X.obs <- X.complete
+  patterns = runif(n*p)<p.miss
+  X.obs[patterns] <- NA
+   
+  # iterate among each combination
+  for (j in 1:(nrow(subsets)-1)){
+    nb.var = sum(subsets[j,])
+    variables = subsets[j,]
+    pos_var=which(variables==1)
+    nb.x = sum(variables)
+    nb.para = (nb.x + 1) + p + p*p 
+    list.saem.subset=miss.saem(X.obs,y,pos_var,maxruns=1000,tol_em=1e-7,nmcmc=2,tau=1,k1=5,print_iter=FALSE,ll_obs_cal=TRUE)
+    ll[nb,j] = list.saem.subset$ll
+    AIC[nb,j] = -2*ll[nb,j]+ 2*nb.para
+    BIC[nb,j] = -2*ll[nb,j]+ nb.para * log(n)
+    
+    if(AIC[nb,j]<=AIC_min[nb,nb.x]){
+      AIC_min[nb,nb.x]= AIC[nb,j]
+      j_AIC[nb,nb.x] = j
+    }
+    if(BIC[nb,j]<=BIC_min[nb,nb.x]){
+      BIC_min[nb,nb.x]= BIC[nb,j]
+      j_BIC[nb,nb.x] = j
+    }
+    if(AIC[nb,j]<=AIC_all_min[nb]){
+      AIC_all_min[nb]= AIC[nb,j]
+      j_all_AIC[nb] = j
+    }
+    if(BIC[nb,j]<=BIC_all_min[nb]){
+      BIC_all_min[nb]= BIC[nb,j]
+      j_all_BIC[nb] = j
+    }
+  }
+}
+
+# 初始化计数器
+count_C_AIC = count_O_AIC = count_U_AIC = 0
+count_C_BIC = count_O_BIC = count_U_BIC = 0
+
+# 遍历每次模拟结果
+for (nb in 1:nb.simu) {
+  # 根据 AIC 选择的最佳模型
+  selected_AIC_model = subsets[j_all_AIC[nb], ]
+  diff_AIC = sum(selected_AIC_model) - sum(beta.star != 0)
+  
+  if (diff_AIC == 0) {
+    count_C_AIC = count_C_AIC + 1  # 真实模型
+  } else if (diff_AIC > 0) {
+    count_O_AIC = count_O_AIC + 1  # 过度拟合
+  } else {
+    count_U_AIC = count_U_AIC + 1  # 欠拟合
+  }
+  
+  # 根据 BIC 选择的最佳模型
+  selected_BIC_model = subsets[j_all_BIC[nb], ]
+  diff_BIC = sum(selected_BIC_model) - sum(beta.star != 0)
+  
+  if (diff_BIC == 0) {
+    count_C_BIC = count_C_BIC + 1  # 真实模型
+  } else if (diff_BIC > 0) {
+    count_O_BIC = count_O_BIC + 1  # 过度拟合
+  } else {
+    count_U_BIC = count_U_BIC + 1  # 欠拟合
+  }
+}
+
+# 计算百分比
+percent_C_AIC = 100 * count_C_AIC / nb.simu
+percent_O_AIC = 100 * count_O_AIC / nb.simu
+percent_U_AIC = 100 * count_U_AIC / nb.simu
+
+percent_C_BIC = 100 * count_C_BIC / nb.simu
+percent_O_BIC = 100 * count_O_BIC / nb.simu
+percent_U_BIC = 100 * count_U_BIC / nb.simu
+
+# 输出结果
+cat("AIC Model Selection:\n")
+cat("Percentage of Correct (C):", percent_C_AIC, "%\n")
+cat("Percentage of Overfitting (O):", percent_O_AIC, "%\n")
+cat("Percentage of Underfitting (U):", percent_U_AIC, "%\n")
+
+cat("\nBIC Model Selection:\n")
+cat("Percentage of Correct (C):", percent_C_BIC, "%\n")
+cat("Percentage of Overfitting (O):", percent_O_BIC, "%\n")
+cat("Percentage of Underfitting (U):", percent_U_BIC, "%\n")
+```
+
+绘制几次模拟的BIC或AIC图。
+
+```{r}
+plot(AIC_min[1,])
+for (i in 1:10){lines(AIC_min[i+1,])}
+abline(v = 4, col = "red", lty = 2)
+
+plot(BIC_min[1,])
+for (i in 1:10){lines(BIC_min[i+1,])}
+abline(v = 4, col = "red", lty = 2)
+```
+
